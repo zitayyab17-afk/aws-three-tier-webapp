@@ -1,0 +1,30 @@
+---
+- name: Configuring The AWS Web Server
+  hosts: aws_ec2
+  become: true
+  tasks:
+    - name: Make sure Apache is installed
+      ansible.builtin.dnf:
+        name: httpd
+        state: present
+
+    - name: Make Sure Apache is running and enabled at reboot
+      ansible.builtin.service:
+        name: httpd
+        state: started
+        enabled: true
+
+    - name: Hide the Apache Version from the Visitors
+      ansible.builtin.copy:
+        src: zz-hardening.conf
+        dest: /etc/httpd/conf.d/zz-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Apache
+
+  handlers:
+    - name: Restart Apache
+      ansible.builtin.service:
+        name: httpd
+        state: restarted
