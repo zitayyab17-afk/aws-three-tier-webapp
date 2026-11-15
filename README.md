@@ -1,8 +1,8 @@
-# Three-Tier Web Application on AWS with Terraform
+# Three-Tier Web Application on AWS with Terraform and Ansible
 
-A highly available web application on AWS, built entirely with Terraform. An internet-facing Application Load Balancer sends traffic to web servers in private subnets across two Availability Zones, managed by an Auto Scaling group, with a PostgreSQL database on Amazon RDS in its own private subnets. Servers are managed through AWS Systems Manager Session Manager, with no SSH keys and no open SSH port.
+A highly available web application on AWS. **Terraform builds** the infrastructure: an internet-facing Application Load Balancer sends traffic to web servers in private subnets across two Availability Zones, managed by an Auto Scaling group, with a PostgreSQL database on Amazon RDS in its own private subnets. **Ansible configures** the web servers over AWS Systems Manager Session Manager, with no SSH keys and no open SSH port.
 
-I wrote every resource myself from the Terraform Registry documentation, then deployed it, tested it (including a self-healing test), and destroyed it.
+I wrote every resource and playbook myself from the Terraform Registry and Ansible documentation, then deployed it, tested it (including a self-healing test and Ansible runs on the live servers), and destroyed it.
 
 ## Architecture
 
@@ -15,6 +15,9 @@ flowchart TD
     NAT --> IGW[Internet gateway]
     ASG -.->|reads DB password| SM[Secrets Manager]
     Admin[Administrator] -.->|Session Manager, no SSH| ASG
+    Ansible[Ansible control node<br/>WSL Ubuntu] -.->|SSM connection, no SSH| ASG
+    Ansible -.->|module files via pre-signed URLs| S3[(S3 bucket<br/>Ansible file transfer)]
+    S3 -.-> ASG
 ```
 
 | Layer | Subnets | AZ a | AZ b | Route to the internet |
@@ -38,7 +41,21 @@ VPC: `10.1.0.0/16` in `eu-west-2` (London). Each tier has its own route table, a
 | `compute.tf` | latest Amazon Linux 2023 arm64 AMI (read from a public SSM parameter), launch template |
 | `user_data.sh` | start-up script: installs and enables Apache, then writes a page showing the instance ID and AZ (using IMDSv2) |
 | `alb.tf` | target group with health check, Application Load Balancer, HTTP listener, Auto Scaling group |
-| `outputs.tf` | the load balancer's DNS name |
+| `ansible.tf` | private S3 bucket that Ansible's Session Manager connection uses to transfer files (`force_destroy` for lab clean-up) |
+| `outputs.tf` | the load balancer's DNS name and the Ansible bucket's name |
+
+## Configuration with Ansible
+
+Terraform builds the servers; Ansible configures what runs inside them.
+
+| File | Purpose |
+|---|---|
+| `ansible/inventory.aws_ec2.yml` | **dynamic inventory** (`amazon.aws.aws_ec2`): asks AWS for running instances tagged `Name = webapp-app` in `eu-west-2`, named by instance ID. Auto Scaling replaces instances, so no IDs are written down |
+| `ansible/group_vars/aws_ec2.yml` | how to connect: `community.aws.aws_ssm` (Session Manager, no SSH), the region, the S3 transfer bucket, and the Python interpreter |
+| `ansible/files/zz-hardening.conf` | `ServerTokens Prod`, so Apache no longer reveals its version |
+| `ansible/webserver.yml` | ensures `httpd` is installed (`dnf`), running and enabled, and deploys the hardening file; a **handler** restarts Apache only when that file changes |
+
+**How the connection works:** the control node uses the AWS CLI credentials, `boto3` and the `session-manager-plugin`. Ansible uploads each module to the S3 bucket and the instance downloads it through a short-lived pre-signed URL, so the instance role needs no S3 permissions, only outbound HTTPS (443) through the NAT gateway.
 
 ## Security decisions
 
@@ -61,6 +78,10 @@ VPC: `10.1.0.0/16` in `eu-west-2` (London). Each tier has its own route table, a
 | **Self-healing** | stopped Apache on one instance | the target went unhealthy, the site stayed up on the other AZ, and the ASG (ELB health checks) replaced the instance automatically |
 | App → database network path | `bash` `/dev/tcp` test to the RDS endpoint on 5432 | port open |
 | Least privilege | read the DB secret (name only), then a wrong secret ID | the DB secret was allowed; the other request got `AccessDenied` |
+| Ansible finds the servers | `ansible-inventory -i inventory.aws_ec2.yml --graph` | both instance IDs listed under `@aws_ec2` |
+| Ansible reaches private servers with no SSH | `ansible aws_ec2 -i inventory.aws_ec2.yml -m ping` | `pong` from both instances over Session Manager |
+| Hardening applied | ran `webserver.yml`, then `curl -sI` through the ALB, several times | `Server: Apache/2.4.x` became `Server: Apache` on both servers (`changed=2`: the file copy and the handler's restart) |
+| Idempotency | ran `webserver.yml` a second time | `changed=0` on both servers, and the handler did not run |
 
 ## Deploy and destroy
 
@@ -69,14 +90,24 @@ Prerequisites: Terraform 1.15+, AWS CLI v2 configured with an IAM user or role (
 ```bash
 cd terraform
 terraform init
-terraform plan      # expect: 39 to add
+terraform plan      # expect: 40 to add
 terraform apply
 ```
 
 Wait 3–5 minutes after `apply`, then open the `alb_dns_name` output with `http://` in a browser.
 
+Then configure the servers with Ansible (control node prerequisites: Ansible with the `amazon.aws` and `community.aws` collections, `boto3`, and the `session-manager-plugin`). Put the `ansible_ssm_bucket` output into `ansible/group_vars/aws_ec2.yml` first.
+
 ```bash
-terraform destroy   # expect: 39 to destroy
+cd ../ansible
+ansible-inventory -i inventory.aws_ec2.yml --graph
+ansible aws_ec2 -i inventory.aws_ec2.yml -m ping
+ansible-playbook -i inventory.aws_ec2.yml webserver.yml
+```
+
+```bash
+cd ../terraform
+terraform destroy   # expect: 40 to destroy
 ```
 
 **Cost:** roughly 10–12p per hour while running (NAT gateway, ALB, RDS, two `t4g.micro` instances and public IPv4 addresses). I deploy it only for testing and destroy it the same day.
@@ -95,7 +126,7 @@ terraform destroy   # expect: 39 to destroy
 
 ## What's next
 
-- **Ansible:** configure and patch the web servers with playbooks
+- **More Ansible:** patching and user management playbooks for the AWS servers (already practised in a local lab)
 - **Version 2 of the app:** a page that reads from and writes to PostgreSQL
 - **HTTPS:** an ACM certificate, a 443 listener and an 80 → 443 redirect
 - **Remote state:** S3 backend with locking
